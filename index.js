@@ -495,11 +495,96 @@ export async function apply(ctx) {
     return shape
   }
 
-  function snapshot() {
+  /**
+   * MCP rows configured outside this plugin: a profile or bundle patch may
+   * insert `@deepseek-ai/dsh-mcp-client` directly. The Plugin Manager owns
+   * their enablement and the Config Editor their configuration, so this plugin
+   * only surfaces them with live status and never mounts a duplicate
+   * connection for them.
+   */
+  async function externalConnections() {
+    const configEditor = ctx.get('configEditor')
+    const pluginManager = ctx.get('pluginManager')
+    const records = new Map()
+    const order = []
+    if (configEditor !== undefined && typeof configEditor.entries === 'function') {
+      try {
+        for (const entry of configEditor.entries()) {
+          if (entry?.options?.name !== MCP_CLIENT_PACKAGE) continue
+          const key = typeof entry.options.id === 'string' ? entry.options.id : undefined
+          if (key === undefined || records.has(key)) continue
+          order.push(key)
+          records.set(key, {
+            config: isRecord(entry.options.config) ? entry.options.config : {},
+            disabled: entry.options.disabled === true,
+            info: undefined,
+          })
+        }
+      } catch (error) {
+        ctx.logger.warn(`mcp-manager: cannot read configured rows: ${errorMessage(error)}`)
+      }
+    }
+    if (pluginManager !== undefined && typeof pluginManager.listPlugins === 'function') {
+      try {
+        for (const info of await pluginManager.listPlugins()) {
+          if (info.moduleName !== MCP_CLIENT_PACKAGE) continue
+          const key = typeof info.patchId === 'string' ? info.patchId : `entry:${String(info.entryId)}`
+          if (!records.has(key)) {
+            order.push(key)
+            records.set(key, { config: {}, disabled: info.enabled === false, info: undefined })
+          }
+          records.get(key).info = info
+        }
+      } catch (error) {
+        ctx.logger.warn(`mcp-manager: cannot read plugin inventory: ${errorMessage(error)}`)
+      }
+    }
+    const rows = []
+    for (const key of order) {
+      const record = records.get(key)
+      const info = record.info
+      const config = record.config
+      const serverName = typeof config.serverName === 'string' && config.serverName.length > 0 ? config.serverName : key
+      const transport = config.transport === 'stdio' || config.transport === 'streamable-http' ? config.transport : null
+      const target =
+        transport === 'streamable-http'
+          ? String(config.url ?? '')
+          : transport === 'stdio'
+            ? [String(config.command ?? ''), ...(Array.isArray(config.args) ? config.args.map(String) : [])].join(' ').trim()
+            : ''
+      const enabled = info !== undefined ? info.enabled !== false : record.disabled !== true
+      const fiberPhase = info !== undefined && typeof info.fiberPhase === 'string' ? info.fiberPhase : undefined
+      const tools = enabled ? toolNamesOf(serverName) : []
+      let phase = 'external'
+      if (!enabled) phase = 'disabled'
+      else if (fiberPhase === 'failed' || (info !== undefined && typeof info.diagnostic === 'string')) phase = 'error'
+      else if (tools.length > 0) phase = 'connected'
+      else if (fiberPhase === 'pending' || fiberPhase === 'loading') phase = 'connecting'
+      const row = {
+        id: info !== undefined ? String(info.entryId) : key,
+        rowId: key,
+        serverName,
+        transport,
+        target,
+        enabled,
+        phase,
+        tools,
+        toggleable: info !== undefined && info.readOnlyReason === undefined,
+      }
+      if (fiberPhase !== undefined) row.fiberPhase = fiberPhase
+      if (info !== undefined && typeof info.diagnostic === 'string' && info.diagnostic.length > 0) row.error = info.diagnostic
+      rows.push(row)
+    }
+    return rows
+  }
+
+  async function snapshot() {
+    const external = await externalConnections()
     return {
       storePath: storeFilePath(),
       mcpClient: state.mcp === null ? { available: false, error: state.mcpError } : { available: true },
       servers: state.servers.map(describe),
+      external,
     }
   }
 
@@ -518,11 +603,15 @@ export async function apply(ctx) {
       const server = normalizeServerInput(definition, existing)
       const clash = state.servers.find((other) => other.id !== server.id && other.serverName === server.serverName)
       if (clash !== undefined) throw new BadRequest(`Server name "${server.serverName}" is already used by "${clash.id}"`)
+      const externalClash = (await externalConnections()).find((row) => row.serverName === server.serverName)
+      if (externalClash !== undefined) {
+        throw new BadRequest(`Server name "${server.serverName}" is already used by the MCP row "${externalClash.rowId}" configured outside this plugin`)
+      }
       if (existing === undefined) state.servers = [...state.servers, server]
       else state.servers = state.servers.map((other) => (other.id === server.id ? server : other))
       await persist()
       reconcile()
-      const result = snapshot()
+      const result = await snapshot()
       result.savedId = server.id
       return result
     })
@@ -554,6 +643,25 @@ export async function apply(ctx) {
       reconcile()
       return snapshot()
     })
+  }
+
+  /** Enable or disable one MCP row that another configuration layer owns. */
+  async function setExternalEnabled(entryId, enabled) {
+    if (typeof entryId !== 'string' || entryId.length === 0) throw new BadRequest('entryId is required')
+    if (typeof enabled !== 'boolean') throw new BadRequest('enabled must be a boolean')
+    const pluginManager = ctx.get('pluginManager')
+    if (pluginManager === undefined || typeof pluginManager.setPluginEnabled !== 'function') {
+      throw new BadRequest('The Plugin Manager is unavailable in this profile')
+    }
+    const result = await pluginManager.setPluginEnabled(entryId, enabled)
+    if (result !== undefined && result !== null && result.application === 'failed') {
+      const reason =
+        result.error !== undefined && result.error !== null && typeof result.error.message === 'string'
+          ? result.error.message
+          : 'unknown failure'
+      throw new Error(`Cannot ${enabled ? 'enable' : 'disable'} the row: ${reason}`)
+    }
+    return snapshot()
   }
 
   /** Connect a draft connection once, report its tool list, and tear it down. */
@@ -598,11 +706,22 @@ export async function apply(ctx) {
     return result
   }
 
+  /** Toggle a managed connection or a row owned by another configuration layer. */
+  async function setEnabledDispatch(id, enabled) {
+    await ensureLoaded()
+    const managed = state.servers.find((server) => server.id === id)
+    if (managed !== undefined) return setEnabled(id, enabled)
+    const row = (await externalConnections()).find((candidate) => candidate.id === id || candidate.rowId === id)
+    if (row === undefined) throw new BadRequest(`Unknown MCP connection or configured row "${id}"`)
+    return setExternalEnabled(row.id, enabled)
+  }
+
   const endpoints = {
     list: () => list(),
     save: (payload) => save(payload),
     remove: (payload) => remove(payload.id),
     setEnabled: (payload) => setEnabled(payload.id, payload.enabled),
+    setExternalEnabled: (payload) => setExternalEnabled(payload.entryId, payload.enabled),
     test: (payload) => test(payload),
   }
 
@@ -622,7 +741,8 @@ export async function apply(ctx) {
       '"update" replaces one (pass `id` and `server`); "remove" deletes one (pass `id`); "enable"/"disable" toggle one (pass `id`); ' +
       '"test" connects a draft `server` once and reports the tools it exposes. A connection definition is ' +
       '`{ serverName, transport: "streamable-http" | "stdio", url? | command?/args?/env?/cwd?, headers?, toolCallTimeoutMs?, enabled? }`; ' +
-      '`serverName` becomes the tool-name prefix `mcp__<serverName>__<tool>`. Saved changes apply immediately.',
+      '`serverName` becomes the tool-name prefix `mcp__<serverName>__<tool>`. Saved changes apply immediately. ' +
+      'MCP rows configured outside this plugin (a profile or bundle patch) are reported under `external`; they belong to that configuration and are not edited here.',
     parameters: {
       type: 'object',
       properties: {
@@ -667,7 +787,7 @@ export async function apply(ctx) {
         case 'enable':
         case 'disable': {
           if (typeof args.id !== 'string' || args.id.length === 0) throw new Error(`id is required for ${action}`)
-          return setEnabled(args.id, action === 'enable')
+          return setEnabledDispatch(args.id, action === 'enable')
         }
         case 'test':
           return test({ server: args.server })

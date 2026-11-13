@@ -59,7 +59,13 @@ window.__ModuleLoader__.load({
       statusError: 'Error',
       statusDisabled: 'Disabled',
       statusStopped: 'Not connected',
+      statusExternal: 'External configuration',
       toolsLabel: 'tools',
+      externalTitle: 'Configured outside this plugin',
+      externalHint:
+        'These MCP rows come from the profile configuration or an installed bundle. They stay owned by that configuration: this page shows their live status and can enable or disable them.',
+      externalBadge: 'external',
+      externalReadonly: 'This row is owned by the profile configuration and cannot be toggled here.',
       refreshFailed: 'Could not load MCP connections',
       saveFailed: 'Could not save the connection',
       removeFailed: 'Could not delete the connection',
@@ -118,7 +124,13 @@ window.__ModuleLoader__.load({
       statusError: 'Ошибка',
       statusDisabled: 'Отключено',
       statusStopped: 'Не подключено',
+      statusExternal: 'Внешняя конфигурация',
       toolsLabel: 'инструм.',
+      externalTitle: 'Настроены вне плагина',
+      externalHint:
+        'Эти подключения MCP заданы конфигурацией профиля или установленным бандлом. Владелец строки — та конфигурация: здесь виден живой статус и доступно включение/отключение.',
+      externalBadge: 'внешнее',
+      externalReadonly: 'Строкой владеет конфигурация профиля, переключать её здесь нельзя.',
       refreshFailed: 'Не удалось загрузить подключения MCP',
       saveFailed: 'Не удалось сохранить подключение',
       removeFailed: 'Не удалось удалить подключение',
@@ -242,6 +254,7 @@ window.__ModuleLoader__.load({
       else if (phase === 'connecting') label = t('statusConnecting')
       else if (phase === 'error') label = t('statusError')
       else if (phase === 'disabled') label = t('statusDisabled')
+      else if (phase === 'external') label = t('statusExternal')
       const tools = Array.isArray(server.tools) ? server.tools : []
       return h(
         'div',
@@ -363,6 +376,47 @@ window.__ModuleLoader__.load({
                 },
                 t('remove'),
               ),
+        ),
+      )
+    }
+
+    function ExternalRow(props) {
+      const { server, t, busy, onToggle } = props
+      return h(
+        'div',
+        { className: 'mcp-mgr-row' },
+        h(
+          'div',
+          { className: 'mcp-mgr-row-main' },
+          h(
+            'div',
+            { className: 'mcp-mgr-name-row' },
+            h('span', { className: 'mcp-mgr-name' }, server.serverName),
+            h('span', { className: 'mcp-mgr-badge' }, t('externalBadge')),
+            server.transport
+              ? h('span', { className: 'mcp-mgr-transport' }, server.transport === 'stdio' ? t('stdio') : t('http'))
+              : null,
+          ),
+          server.target ? h('div', { className: 'mcp-mgr-target', title: server.target }, server.target) : null,
+          h(StatusLine, { server, t }),
+        ),
+        h(
+          'div',
+          { className: 'mcp-mgr-row-actions' },
+          h(
+            'button',
+            {
+              type: 'button',
+              role: 'switch',
+              'aria-checked': server.enabled ? 'true' : 'false',
+              'aria-label': t('enabled'),
+              title: server.toggleable ? t('enabled') : t('externalReadonly'),
+              className: `mcp-mgr-switch${server.enabled ? ' on' : ''}`,
+              disabled: busy || !server.toggleable,
+              onClick: () => onToggle(server),
+            },
+            h('span', { className: 'mcp-mgr-switch-knob' }),
+          ),
         ),
       )
     }
@@ -577,6 +631,7 @@ window.__ModuleLoader__.load({
       const [formError, setFormError] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
       const [busyId, setBusyId] = React.useState(null)
+      const [externalBusy, setExternalBusy] = React.useState(null)
       const [tests, setTests] = React.useState({})
 
       const load = React.useCallback(async () => {
@@ -605,6 +660,7 @@ window.__ModuleLoader__.load({
 
       const data = snapshot.data
       const servers = data !== null && Array.isArray(data.servers) ? data.servers : []
+      const external = data !== null && Array.isArray(data.external) ? data.external : []
 
       const beginAdd = () => {
         setDraft({ ...emptyDraft })
@@ -697,6 +753,19 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const toggleExternal = async (server) => {
+        setExternalBusy(server.id)
+        setNotice(null)
+        try {
+          const next = await callEndpoint(rpc, 'setExternalEnabled', { entryId: server.id, enabled: !server.enabled })
+          applySnapshot(next)
+        } catch (error) {
+          setNotice({ kind: 'error', text: `${t('toggleFailed')}: ${messageOf(error)}` })
+        } finally {
+          setExternalBusy(null)
+        }
+      }
+
       const unavailable = data !== null && data.mcpClient !== undefined && data.mcpClient !== null && data.mcpClient.available === false
 
       return h(
@@ -742,7 +811,7 @@ window.__ModuleLoader__.load({
             })
           : null,
         snapshot.loading && data === null ? h('div', { className: 'mcp-mgr-muted' }, t('loading')) : null,
-        data !== null && servers.length === 0 && !snapshot.loading
+        data !== null && servers.length === 0 && external.length === 0 && !snapshot.loading
           ? h('div', { className: 'mcp-mgr-empty' }, t('empty'))
           : null,
         h(
@@ -762,6 +831,27 @@ window.__ModuleLoader__.load({
             }),
           ),
         ),
+        external.length > 0
+          ? h(
+              'div',
+              { className: 'mcp-mgr-external' },
+              h('div', { className: 'mcp-mgr-external-title' }, t('externalTitle')),
+              h('div', { className: 'mcp-mgr-hint' }, t('externalHint')),
+              h(
+                'div',
+                { className: 'mcp-mgr-list' },
+                external.map((server) =>
+                  h(ExternalRow, {
+                    key: server.id,
+                    server,
+                    t,
+                    busy: externalBusy === server.id,
+                    onToggle: toggleExternal,
+                  }),
+                ),
+              ),
+            )
+          : null,
         data !== null && typeof data.storePath === 'string'
           ? h('div', { className: 'mcp-mgr-store' }, `${t('store')} ${data.storePath}`)
           : null,
@@ -786,6 +876,9 @@ window.__ModuleLoader__.load({
 .mcp-mgr-name-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .mcp-mgr-name { font-weight: 600; font-size: 13px; }
 .mcp-mgr-transport { font-size: 11px; color: var(--dsw-alias-label-secondary); border: 1px solid var(--dsw-alias-border-l1); border-radius: 999px; padding: 0 7px; }
+.mcp-mgr-badge { font-size: 11px; color: var(--dsw-alias-label-secondary); border: 1px dashed var(--dsw-alias-border-l2); border-radius: 999px; padding: 0 7px; }
+.mcp-mgr-external { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.mcp-mgr-external-title { font-weight: 600; font-size: 13px; margin-bottom: -4px; }
 .mcp-mgr-target { color: var(--dsw-alias-label-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; overflow-wrap: anywhere; }
 .mcp-mgr-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dsw-alias-label-secondary); flex-wrap: wrap; }
 .mcp-mgr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); flex: none; }
