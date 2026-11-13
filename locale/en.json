@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP connections",
+    "description": "Manage Model Context Protocol servers from Settings → MCP, with live status, per-server enablement, and a connection test. The same operations are available to the agent through the mcp_connections tool."
+  }
+}

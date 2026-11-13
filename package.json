@@ -1,0 +1,51 @@
+{
+  "name": "dsh-plugin-mcp-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Manage MCP server connections in DeepSeek Harness: a Settings → MCP page and an mcp_connections agent tool",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zznobzz/dsh-plugin-mcp-manager.git"
+  },
+  "homepage": "https://github.com/zznobzz/dsh-plugin-mcp-manager#readme",
+  "bugs": {
+    "url": "https://github.com/zznobzz/dsh-plugin-mcp-manager/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

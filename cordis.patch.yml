@@ -1,0 +1,5 @@
+# Bundle self-activation patch: installing this package into a profile inserts
+# the MCP connection manager (Host half + Settings → MCP page).
+- insert:
+    - id: mcp-manager
+      name: dsh-plugin-mcp-manager
