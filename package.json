@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-mcp-manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Manage MCP server connections in DeepSeek Harness: a Settings → MCP page and an mcp_connections agent tool",

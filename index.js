@@ -198,6 +198,134 @@ function toMcpConfig(server) {
   return config
 }
 
+/**
+ * Config files of other MCP clients whose `mcpServers` map can be imported.
+ * Only well-known per-user locations are read; nothing is written to them.
+ */
+function importSources() {
+  const sources = [{ id: 'cursor', label: 'Cursor', file: join(homedir(), '.cursor', 'mcp.json'), key: 'mcpServers' }]
+  const appData =
+    process.platform === 'win32'
+      ? typeof process.env.APPDATA === 'string' && process.env.APPDATA.length > 0
+        ? process.env.APPDATA
+        : join(homedir(), 'AppData', 'Roaming')
+      : process.platform === 'darwin'
+        ? join(homedir(), 'Library', 'Application Support')
+        : join(homedir(), '.config')
+  sources.push({
+    id: 'claude-desktop',
+    label: 'Claude Desktop',
+    file: join(appData, 'Claude', 'claude_desktop_config.json'),
+    key: 'mcpServers',
+  })
+  sources.push({ id: 'vscode', label: 'VS Code', file: join(appData, 'Code', 'User', 'mcp.json'), key: 'servers' })
+  return sources
+}
+
+/** Strip `//` and `/* *\/` comments plus trailing commas so JSONC configs parse. */
+function stripJsonComments(text) {
+  let out = ''
+  let inString = false
+  let escaped = false
+  let lineComment = false
+  let blockComment = false
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    const next = text[index + 1]
+    if (lineComment) {
+      if (char === '\n') {
+        lineComment = false
+        out += char
+      }
+      continue
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false
+        index += 1
+      }
+      continue
+    }
+    if (inString) {
+      out += char
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      out += char
+      continue
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true
+      index += 1
+      continue
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true
+      index += 1
+      continue
+    }
+    out += char
+  }
+  return out.replace(/,(\s*[}\]])/g, '$1')
+}
+
+/** Derive a unique `serverName` matching the MCP client's name contract. */
+function sanitizeServerName(rawName, used) {
+  let base = String(rawName)
+    .replace(/[^A-Za-z0-9_-]/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32)
+  if (base.length === 0) base = 'server'
+  let candidate = base
+  let counter = 2
+  while (used.has(candidate)) {
+    const suffix = `_${counter}`
+    candidate = `${base.slice(0, 32 - suffix.length)}${suffix}`
+    counter += 1
+  }
+  used.add(candidate)
+  return candidate
+}
+
+/** Translate one foreign `mcpServers` entry into this plugin's definition. */
+function importedDefinition(rawName, raw, used) {
+  if (!isRecord(raw)) return { error: 'entry is not an object' }
+  const command = typeof raw.command === 'string' ? raw.command.trim() : ''
+  const url = typeof raw.url === 'string' ? raw.url.trim() : ''
+  const transport = command.length > 0 ? 'stdio' : url.length > 0 ? 'streamable-http' : undefined
+  if (transport === undefined) return { error: 'entry has neither "command" nor "url"' }
+  const timeout = Number(raw.timeout)
+  const candidate = {
+    serverName: sanitizeServerName(rawName, used),
+    transport,
+    enabled: raw.disabled !== true,
+    toolCallTimeoutMs:
+      Number.isInteger(timeout) && timeout >= 1 && timeout <= MAX_TOOL_TIMEOUT_MS ? timeout : DEFAULT_TOOL_TIMEOUT_MS,
+  }
+  if (transport === 'streamable-http') {
+    candidate.url = url
+    candidate.headers = isRecord(raw.headers)
+      ? Object.fromEntries(Object.entries(raw.headers).filter(([key, value]) => !taboo(key) && typeof value === 'string'))
+      : {}
+  } else {
+    candidate.command = command
+    candidate.args = Array.isArray(raw.args) ? raw.args.filter((value) => typeof value === 'string') : []
+    candidate.env = isRecord(raw.env)
+      ? Object.fromEntries(Object.entries(raw.env).filter(([key, value]) => !taboo(key) && typeof value === 'string'))
+      : {}
+    candidate.cwd = typeof raw.cwd === 'string' ? raw.cwd : ''
+  }
+  try {
+    return { server: normalizeServerInput(candidate) }
+  } catch (error) {
+    return { error: errorMessage(error) }
+  }
+}
+
 /** The public, persisted shape of one connection. */
 function publicServer(server) {
   const shape = {
@@ -645,6 +773,118 @@ export async function apply(ctx) {
     })
   }
 
+  /** Read one foreign MCP config file without failing the whole scan. */
+  async function readImportedConfig(source) {
+    let text
+    try {
+      text = await readFile(source.file, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { available: false }
+      throw new Error(`Cannot read ${source.file}: ${errorMessage(error)}`)
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(stripJsonComments(text))
+    } catch (error) {
+      return { available: true, error: `Cannot parse ${source.file}: ${errorMessage(error)}` }
+    }
+    const map = isRecord(parsed) && isRecord(parsed[source.key]) ? parsed[source.key] : {}
+    return { available: true, config: map }
+  }
+
+  /** List importable MCP entries of known foreign clients (secrets-free preview). */
+  async function scanImports() {
+    await ensureLoaded()
+    const used = new Set(state.servers.map((server) => server.serverName))
+    for (const row of await externalConnections()) used.add(row.serverName)
+    const sources = []
+    for (const source of importSources()) {
+      const entry = { id: source.id, label: source.label, path: source.file }
+      try {
+        const read = await readImportedConfig(source)
+        if (read.available === false) {
+          entry.available = false
+          sources.push(entry)
+          continue
+        }
+        entry.available = true
+        if (typeof read.error === 'string') {
+          entry.error = read.error
+          sources.push(entry)
+          continue
+        }
+        const servers = []
+        for (const name of Object.keys(read.config)) {
+          const definition = importedDefinition(name, read.config[name], used)
+          if (definition.error !== undefined) {
+            servers.push({ name, error: definition.error })
+            continue
+          }
+          const server = definition.server
+          servers.push({
+            name,
+            serverName: server.serverName,
+            transport: server.transport,
+            target:
+              server.transport === 'streamable-http'
+                ? server.url
+                : `${server.command}${server.args.length > 0 ? ` (+${server.args.length} args)` : ''}`,
+            enabled: server.enabled,
+          })
+        }
+        entry.servers = servers
+      } catch (error) {
+        entry.available = true
+        entry.error = errorMessage(error)
+      }
+      sources.push(entry)
+    }
+    return { sources }
+  }
+
+  /** Import selected foreign entries as managed connections of this plugin. */
+  async function importServers(sourceId, names) {
+    return exclusive(async () => {
+      await ensureLoaded()
+      const source = importSources().find((candidate) => candidate.id === sourceId)
+      if (source === undefined) throw new BadRequest(`Unknown import source "${sourceId}"`)
+      const read = await readImportedConfig(source)
+      if (read.available === false) throw new BadRequest(`Config file ${source.file} does not exist`)
+      if (typeof read.error === 'string') throw new BadRequest(read.error)
+      const config = read.config
+      const wanted = Array.isArray(names) && names.length > 0 ? names.filter((name) => typeof name === 'string') : Object.keys(config)
+      const used = new Set(state.servers.map((server) => server.serverName))
+      const externalNames = new Set((await externalConnections()).map((row) => row.serverName))
+      const imported = []
+      const skipped = []
+      for (const name of wanted) {
+        if (!Object.hasOwn(config, name)) {
+          skipped.push({ name, reason: 'not present in the source file' })
+          continue
+        }
+        const definition = importedDefinition(name, config[name], used)
+        if (definition.error !== undefined) {
+          skipped.push({ name, reason: definition.error })
+          continue
+        }
+        if (externalNames.has(definition.server.serverName)) {
+          skipped.push({ name, reason: `server name "${definition.server.serverName}" is already used outside this plugin` })
+          continue
+        }
+        state.servers = [...state.servers, definition.server]
+        imported.push({ name, serverName: definition.server.serverName })
+      }
+      if (imported.length > 0) {
+        await persist()
+        reconcile()
+      }
+      const result = await snapshot()
+      result.imported = imported
+      result.skipped = skipped
+      return result
+    })
+  }
+
   /** Enable or disable one MCP row that another configuration layer owns. */
   async function setExternalEnabled(entryId, enabled) {
     if (typeof entryId !== 'string' || entryId.length === 0) throw new BadRequest('entryId is required')
@@ -722,6 +962,8 @@ export async function apply(ctx) {
     remove: (payload) => remove(payload.id),
     setEnabled: (payload) => setEnabled(payload.id, payload.enabled),
     setExternalEnabled: (payload) => setExternalEnabled(payload.entryId, payload.enabled),
+    importScan: () => scanImports(),
+    import: (payload) => importServers(payload.sourceId, payload.names),
     test: (payload) => test(payload),
   }
 
@@ -742,18 +984,30 @@ export async function apply(ctx) {
       '"test" connects a draft `server` once and reports the tools it exposes. A connection definition is ' +
       '`{ serverName, transport: "streamable-http" | "stdio", url? | command?/args?/env?/cwd?, headers?, toolCallTimeoutMs?, enabled? }`; ' +
       '`serverName` becomes the tool-name prefix `mcp__<serverName>__<tool>`. Saved changes apply immediately. ' +
-      'MCP rows configured outside this plugin (a profile or bundle patch) are reported under `external`; they belong to that configuration and are not edited here.',
+      'MCP rows configured outside this plugin (a profile or bundle patch) are reported under `external`; they belong to that configuration and are not edited here. ' +
+      'Actions "importScan" and "import" read the MCP configuration of other installed clients (Cursor, Claude Desktop, VS Code) so their servers can be added here: ' +
+      '"importScan" lists the candidates, "import" adds the selected names from one source (pass `sourceId` and `names`).',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'add', 'update', 'remove', 'enable', 'disable', 'test'],
+          enum: ['list', 'add', 'update', 'remove', 'enable', 'disable', 'test', 'importScan', 'import'],
           description: 'Operation to perform.',
         },
         id: {
           type: 'string',
           description: 'Connection id from "list"; required for update, remove, enable, and disable.',
+        },
+        sourceId: {
+          type: 'string',
+          enum: ['cursor', 'claude-desktop', 'vscode'],
+          description: 'Import source for "importScan" and "import".',
+        },
+        names: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Server names from the source config to import; omit to import every entry of the source.',
         },
         server: {
           type: 'object',
@@ -791,8 +1045,15 @@ export async function apply(ctx) {
         }
         case 'test':
           return test({ server: args.server })
+        case 'importScan':
+          return scanImports()
+        case 'import':
+          if (typeof args.sourceId !== 'string' || args.sourceId.length === 0) throw new Error('sourceId is required for import')
+          return importServers(args.sourceId, args.names)
         default:
-          throw new Error(`Unknown action ${JSON.stringify(action)}; use list, add, update, remove, enable, disable, or test`)
+          throw new Error(
+            `Unknown action ${JSON.stringify(action)}; use list, add, update, remove, enable, disable, test, importScan, or import`,
+          )
       }
     },
   }

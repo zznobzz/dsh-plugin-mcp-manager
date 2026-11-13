@@ -66,6 +66,18 @@ window.__ModuleLoader__.load({
         'These MCP rows come from the profile configuration or an installed bundle. They stay owned by that configuration: this page shows their live status and can enable or disable them.',
       externalBadge: 'external',
       externalReadonly: 'This row is owned by the profile configuration and cannot be toggled here.',
+      importLabel: 'Import…',
+      importTitle: 'Import MCP servers',
+      importHint:
+        'Servers configured in Cursor, Claude Desktop, or VS Code can be copied into this plugin. The other applications’ files are only read, never modified.',
+      importEmpty: 'No MCP configuration files from other applications were found.',
+      importMissing: 'file not found',
+      importSelectAll: 'Select all',
+      importRun: 'Import selected',
+      importRunning: 'Importing…',
+      importDone: 'Imported',
+      importSkipped: 'skipped',
+      importFailed: 'Import failed',
       refreshFailed: 'Could not load MCP connections',
       saveFailed: 'Could not save the connection',
       removeFailed: 'Could not delete the connection',
@@ -131,6 +143,18 @@ window.__ModuleLoader__.load({
         'Эти подключения MCP заданы конфигурацией профиля или установленным бандлом. Владелец строки — та конфигурация: здесь виден живой статус и доступно включение/отключение.',
       externalBadge: 'внешнее',
       externalReadonly: 'Строкой владеет конфигурация профиля, переключать её здесь нельзя.',
+      importLabel: 'Импортировать…',
+      importTitle: 'Импорт MCP-серверов',
+      importHint:
+        'Серверы, настроенные в Cursor, Claude Desktop или VS Code, можно скопировать в этот плагин. Файлы других приложений только читаются и не изменяются.',
+      importEmpty: 'Файлы конфигурации MCP других приложений не найдены.',
+      importMissing: 'файл не найден',
+      importSelectAll: 'Выбрать все',
+      importRun: 'Импортировать выбранные',
+      importRunning: 'Импорт…',
+      importDone: 'Импортировано',
+      importSkipped: 'пропущено',
+      importFailed: 'Не удалось импортировать',
       refreshFailed: 'Не удалось загрузить подключения MCP',
       saveFailed: 'Не удалось сохранить подключение',
       removeFailed: 'Не удалось удалить подключение',
@@ -632,6 +656,11 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null)
       const [busyId, setBusyId] = React.useState(null)
       const [externalBusy, setExternalBusy] = React.useState(null)
+      const [importOpen, setImportOpen] = React.useState(false)
+      const [importData, setImportData] = React.useState(null)
+      const [importError, setImportError] = React.useState(null)
+      const [importBusy, setImportBusy] = React.useState(false)
+      const [importSelection, setImportSelection] = React.useState({})
       const [tests, setTests] = React.useState({})
 
       const load = React.useCallback(async () => {
@@ -766,6 +795,118 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const openImport = async () => {
+        setImportOpen(true)
+        setImportData(null)
+        setImportError(null)
+        setImportSelection({})
+        try {
+          const data = await callEndpoint(rpc, 'importScan', {})
+          setImportData(data)
+        } catch (error) {
+          setImportError(messageOf(error))
+        }
+      }
+
+      const toggleImport = (sourceId, name) => {
+        setImportSelection((previous) => {
+          const current = Array.isArray(previous[sourceId]) ? previous[sourceId] : []
+          const next = current.includes(name) ? current.filter((item) => item !== name) : [...current, name]
+          return { ...previous, [sourceId]: next }
+        })
+      }
+
+      const toggleImportAll = (sourceId, names) => {
+        setImportSelection((previous) => {
+          const current = Array.isArray(previous[sourceId]) ? previous[sourceId] : []
+          const allSelected = names.length > 0 && names.every((name) => current.includes(name))
+          return { ...previous, [sourceId]: allSelected ? [] : [...names] }
+        })
+      }
+
+      const runImport = async () => {
+        if (importData === null) return
+        setImportBusy(true)
+        setImportError(null)
+        const imported = []
+        const skipped = []
+        try {
+          for (const source of importData.sources ?? []) {
+            const names = Array.isArray(importSelection[source.id]) ? importSelection[source.id] : []
+            if (names.length === 0) continue
+            const result = await callEndpoint(rpc, 'import', { sourceId: source.id, names })
+            imported.push(...(Array.isArray(result.imported) ? result.imported : []))
+            skipped.push(...(Array.isArray(result.skipped) ? result.skipped : []))
+            applySnapshot(result)
+          }
+          if (imported.length > 0) await load()
+          setNotice({
+            kind: skipped.length > 0 ? 'error' : 'ok',
+            text: `${t('importDone')}: ${imported.length}${skipped.length > 0 ? ` · ${t('importSkipped')}: ${skipped.length}` : ''}`,
+          })
+          setImportOpen(false)
+          setImportData(null)
+        } catch (error) {
+          setImportError(messageOf(error))
+        } finally {
+          setImportBusy(false)
+        }
+      }
+
+      const renderImportSource = (source) => {
+        if (source.available === false) {
+          return h(
+            'div',
+            { className: 'mcp-mgr-import-source' },
+            h(
+              'div',
+              { className: 'mcp-mgr-import-head' },
+              h('span', { className: 'mcp-mgr-name' }, source.label),
+              h('span', { className: 'mcp-mgr-muted' }, t('importMissing')),
+            ),
+            h('div', { className: 'mcp-mgr-store' }, source.path),
+          )
+        }
+        const entries = Array.isArray(source.servers) ? source.servers : []
+        const names = entries.filter((entry) => entry.error === undefined).map((entry) => entry.name)
+        const selected = Array.isArray(importSelection[source.id]) ? importSelection[source.id] : []
+        return h(
+          'div',
+          { className: 'mcp-mgr-import-source' },
+          h(
+            'div',
+            { className: 'mcp-mgr-import-head' },
+            h('span', { className: 'mcp-mgr-name' }, source.label),
+            names.length > 0
+              ? h(
+                  'button',
+                  { type: 'button', className: 'mcp-mgr-btn', onClick: () => toggleImportAll(source.id, names) },
+                  t('importSelectAll'),
+                )
+              : null,
+          ),
+          h('div', { className: 'mcp-mgr-store' }, source.path),
+          source.error !== undefined ? h('div', { className: 'mcp-mgr-error-text' }, source.error) : null,
+          entries.map((entry) =>
+            h(
+              'label',
+              { key: entry.name, className: 'mcp-mgr-import-row' },
+              entry.error !== undefined
+                ? null
+                : h('input', {
+                    type: 'checkbox',
+                    checked: selected.includes(entry.name),
+                    onChange: () => toggleImport(source.id, entry.name),
+                  }),
+              h('span', { className: 'mcp-mgr-import-name' }, entry.name),
+              entry.error !== undefined
+                ? h('span', { className: 'mcp-mgr-error-text' }, entry.error)
+                : h('span', { className: 'mcp-mgr-muted' }, `${entry.transport === 'stdio' ? t('stdio') : t('http')} · ${entry.target}`),
+            ),
+          ),
+        )
+      }
+
       const unavailable = data !== null && data.mcpClient !== undefined && data.mcpClient !== null && data.mcpClient.available === false
 
       return h(
@@ -784,6 +925,11 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'mcp-mgr-header-actions' },
             h('button', { type: 'button', className: 'mcp-mgr-btn', onClick: () => load() }, t('refresh')),
+            h(
+              'button',
+              { type: 'button', className: 'mcp-mgr-btn', onClick: () => (importOpen ? setImportOpen(false) : openImport()), disabled: editing !== null },
+              t('importLabel'),
+            ),
             h('button', { type: 'button', className: 'mcp-mgr-btn primary', onClick: beginAdd, disabled: editing !== null }, t('add')),
           ),
         ),
@@ -798,6 +944,50 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'mcp-mgr-banner err' }, `${t('refreshFailed')}: ${snapshot.error}`)
           : null,
         notice !== null ? h('div', { className: `mcp-mgr-banner ${notice.kind === 'error' ? 'err' : 'ok'}` }, notice.text) : null,
+        importOpen
+          ? h(
+              'div',
+              { className: 'mcp-mgr-form' },
+              h('div', { className: 'mcp-mgr-form-title' }, t('importTitle')),
+              h('div', { className: 'mcp-mgr-hint' }, t('importHint')),
+              importError !== null
+                ? h('div', { className: 'mcp-mgr-banner err' }, `${t('importFailed')}: ${importError}`)
+                : null,
+              importData === null
+                ? h('div', { className: 'mcp-mgr-muted' }, t('loading'))
+                : (importData.sources ?? []).every((source) => source.available === false)
+                  ? h('div', { className: 'mcp-mgr-muted' }, t('importEmpty'))
+                  : (importData.sources ?? []).map((source) => renderImportSource(source)),
+              h(
+                'div',
+                { className: 'mcp-mgr-form-actions' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'mcp-mgr-btn primary',
+                    disabled: importBusy || !Object.values(importSelection).some((names) => Array.isArray(names) && names.length > 0),
+                    onClick: runImport,
+                  },
+                  importBusy ? t('importRunning') : t('importRun'),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'mcp-mgr-btn',
+                    disabled: importBusy,
+                    onClick: () => {
+                      setImportOpen(false)
+                      setImportData(null)
+                      setImportError(null)
+                    },
+                  },
+                  t('cancel'),
+                ),
+              ),
+            )
+          : null,
         editing !== null
           ? h(ServerForm, {
               mode: editing.mode,
@@ -879,6 +1069,11 @@ window.__ModuleLoader__.load({
 .mcp-mgr-badge { font-size: 11px; color: var(--dsw-alias-label-secondary); border: 1px dashed var(--dsw-alias-border-l2); border-radius: 999px; padding: 0 7px; }
 .mcp-mgr-external { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
 .mcp-mgr-external-title { font-weight: 600; font-size: 13px; margin-bottom: -4px; }
+.mcp-mgr-import-source { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l1); }
+.mcp-mgr-import-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mcp-mgr-import-row { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; }
+.mcp-mgr-import-row input[type="checkbox"] { accent-color: var(--dsw-alias-brand-primary); margin: 0; }
+.mcp-mgr-import-name { font-weight: 500; white-space: nowrap; }
 .mcp-mgr-target { color: var(--dsw-alias-label-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; overflow-wrap: anywhere; }
 .mcp-mgr-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dsw-alias-label-secondary); flex-wrap: wrap; }
 .mcp-mgr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); flex: none; }

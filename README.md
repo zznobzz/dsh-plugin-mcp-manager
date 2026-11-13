@@ -75,6 +75,31 @@ mcp_connections action=remove  id=<id>
 
 Через агента: `mcp_connections action=disable id=include:<row-id>` (id строки виден в `list`).
 
+### Импорт из Cursor / Claude Desktop / VS Code
+
+Если MCP-серверы уже настроены в другом клиенте, плагин умеет их скопировать к себе:
+кнопка **«Импортировать…»** на странице MCP (или `mcp_connections action=importScan` /
+`action=import` у агента).
+
+Читаются только известные пользовательские файлы, без записи в них:
+
+| Источник | Файл | Ключ |
+| --- | --- | --- |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers` |
+| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/…`) | `mcpServers` |
+| VS Code | `%APPDATA%\Code\User\mcp.json` (`~/.config/Code/User/mcp.json` на Linux) | `servers` |
+
+Особенности:
+
+- конфиги Cursor/VS Code часто в формате JSONC — комментарии и висячие запятые допускаются;
+- `url` → транспорт Streamable HTTP (`headers` переносятся), `command`/`args`/`env` → stdio;
+  `timeout` → таймаут вызова инструмента;
+- имена из конфига нормализуются под `^[A-Za-z0-9_-]{1,32}$` (например,
+  `io.github.upstash/context7` → `io_github_upstash_context7`), конфликты получают суффикс;
+- в предпросмотре цели показаны без секретов (для stdio — команда и число аргументов);
+  после импорта `args`/`env`/`headers` сохраняются в файл плагина как есть — те же, что были
+  в исходном конфиге, включая секреты.
+
 ## Хранение
 
 Определения подключений: `$DSH_HOME/plugins/mcp-manager/servers.json`
@@ -87,7 +112,7 @@ mcp_connections action=remove  id=<id>
 - **Host** (`index.js`): хранит список, монтирует по одному экземпляру
   `@deepseek-ai/dsh-mcp-client` на включённый сервер через `ctx.plugin()`,
   собирает статусы и имена инструментов, отдаёт REST-подобные эндпоинты
-  `/api/mcp-manager.list|save|remove|setEnabled|setExternalEnabled|test` на общем канале `connection.fetch`
+  `/api/mcp-manager.list|save|remove|setEnabled|setExternalEnabled|importScan|import|test` на общем канале `connection.fetch`
   и регистрирует инструмент `mcp_connections`. Строки `@deepseek-ai/dsh-mcp-client`,
   настроенные вне плагина, читаются через сервисы `configEditor` (конфигурация) и
   `pluginManager` (включённость, состояние, диагностика) и не монтируются повторно.
