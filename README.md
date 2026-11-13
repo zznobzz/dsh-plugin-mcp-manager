@@ -81,7 +81,8 @@ mcp_connections action=remove  id=<id>
 
 ## Проверка
 
-`test/mcp-demo-server.mjs` — минимальный локальный MCP-сервер (stdio, инструмент `echo`):
+В репозитории лежит `test/mcp-demo-server.mjs` — минимальный локальный MCP-сервер
+(stdio, инструмент `echo`). Он не входит в устанавливаемый пакет (см. `files`):
 
 ```
 node test/mcp-demo-server.mjs
